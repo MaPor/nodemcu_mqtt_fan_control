@@ -1,0 +1,308 @@
+//Stromzähler IP 112
+
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+
+const char* ssid = "+++";
+const char* password = "+++";
+IPAddress ip(127, 0, 0, 1);
+IPAddress server(192,168,178,107);
+
+WiFiClient espClient9;
+PubSubClient client(espClient9);
+
+//Init-Werte hier eingeben //////////////
+int thres_1 = 80;//10; //60;  // below thres_1 red mark is in front of sensor
+int thres_2 = 110;//300; //70;  // more than thres_2 red mark is not in front of sensor
+long stromzaehler_overall_kwh = 68506;
+long stromzaehler_overall_nachkomma = 5000;
+int debug_cycle=5000;
+//////////////////////////////////////////
+
+String zaehler; 
+static char verbrauch[15];
+
+//NodeMCU has weird pin mapping.
+//static const uint8_t D0   = 16;
+//static const uint8_t D1   = 5;
+//static const uint8_t D2   = 4;
+//static const uint8_t D3   = 0;
+//static const uint8_t D4   = 2;
+//static const uint8_t D5   = 14;
+//static const uint8_t D6   = 12;
+//static const uint8_t D7   = 13;
+//static const uint8_t D8   = 15;
+//static const uint8_t D9   = 3;
+//static const uint8_t D10  = 1;
+const int analogInPin = 0;  // Analog input pin that the photo transistor is attached to
+const int irOutPin = 4; // Digital output pin that the IR-LED is attached to
+const int LED_green = 12;
+const int LED_red = 5;
+const int LED_blue = 0;
+const int LED_yellow = 2;
+
+int sensorValueOff = 0;  // value read from the photo transistor when ir LED is off
+int sensorValueOn = 0;  // value read from the photo transistor when ir LED is on
+
+
+bool red_mark_memory = 0;   //  silber -> gesucht wird erstes auftauchen von rot
+unsigned long redmark_last_millis=0;
+unsigned long delta_redmark=0;
+float verbrauch_aktuell=0;
+
+
+unsigned long lastReconnectAttempt = 0;
+unsigned long previousMillis = 0; //Zählervariable, zählt Millisekunden seit dem letzten Funktionsaufruf nach oben
+const long interval = 5000; //120000 Millisekunden aka 120 Sekunden, das Interval wie oft der Sensor überhaupt benutzt wird
+
+int relais = 0;
+String myString ="";
+int delaytime= 400;
+
+//Float to be stored in EEPROM
+//float f_eeprom = 0.0f;
+//float f_eeprom2 = 0.0f;
+int eeAddress = 0;
+
+//Gleitender Mittelwert
+float ETA=0.9999; // ETA nimm soviel Prozent vom Modell (gl. Durchschnitt)
+float Mittelwert_silber = 200;  // vorher init 300: nicht so gut. löst oft aus, da delta von 30 drunter abgefragt wird
+float Output = 300;
+
+
+void callback(char* topic, byte* payload, unsigned int length) {
+   
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  
+  for (int i=0;i<length;i++) {
+    char receivedChar = (char)payload[i];
+    Serial.print(receivedChar);
+    //if (receivedChar == '0')
+    //  Serial.print("Null");
+    //if (receivedChar == '1')
+    //  Serial.print("Eins");
+  }
+  Serial.println();
+  
+  payload[length]='\0';
+
+  // Es wird folgender String erwartet
+  // thres_1:thres_2:zahler_gesamt:update_rate
+  // Bsp
+  // 50:70:65678.3:100
+  //mosquitto_pub -t "fhem/power/input" -m "20:110:4444.0:15"
+
+  
+  myString = String((char*)payload);
+  String s1 = getValue(myString, ':', 0);
+  String s2 = getValue(myString, ':', 1);
+  String s3 = getValue(myString, ':', 2);
+  String s4 = getValue(myString, ':', 3);
+  String s5 = getValue(myString, ':', 4);
+  Serial.println("S1: " + s1);
+  Serial.println("S2: " + s2);
+  relais = s1.toInt();
+  Serial.print("RelaisNr: ");Serial.println(relais);
+
+ 
+}
+
+String getValue(String data, char separator, int index)
+{
+    int found = 0;
+    int strIndex[] = { 12, -1 };
+    int maxIndex = data.length() - 1;
+
+    for (int i = 0; i <= maxIndex && found <= index; i++) {
+        if (data.charAt(i) == separator || i == maxIndex) {
+            found++;
+            strIndex[0] = strIndex[1] + 1;
+            strIndex[1] = (i == maxIndex) ? i+1 : i;
+        }
+    }
+    return found > index ? data.substring(strIndex[0], strIndex[1]) : "";
+}
+
+
+
+
+boolean reconnect() {
+    if (client.connect("arduino9Client","fhem/relais/mqtt_status",0,true,"offline")) {
+      Serial.println("re-connected");
+      // Once connected, publish an announcement...
+      client.publish("fhem/relais/set","Reconnect: hello world from relais",true);
+      // ... and resubscribe
+      client.subscribe("fhem/relais/input");
+      //client.loop();
+    }
+    return client.connected();
+}
+
+void setup() {
+  // put your setup code here, to run once:
+    Serial.begin(115200);
+    delay(50);
+   
+    pinMode(13, OUTPUT);  //D4//D3
+    pinMode(12, OUTPUT); 
+    
+    // Connect to WiFi network
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+ 
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+ 
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi Relais connected");
+
+  client.setServer(server, 1883);
+  client.setCallback(callback);
+
+  lastReconnectAttempt = 0;
+  
+  // initialize the digital pins as an output.
+  pinMode(irOutPin, OUTPUT);
+  pinMode(LED_green, OUTPUT);
+  pinMode(LED_red, OUTPUT);
+  pinMode(LED_blue, OUTPUT);
+  pinMode(LED_yellow, OUTPUT);
+
+  // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  // ArduinoOTA.setHostname("myesp8266");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword((const char *)"123");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+
+// Für Flashing over the Air
+ArduinoOTA.handle();
+//////////////////
+unsigned long currentMillis = millis(); 
+
+    if (!client.connected()) {
+        //long now = millis();
+        if (currentMillis - lastReconnectAttempt > 5000) {
+          lastReconnectAttempt = currentMillis;
+          // Attempt to reconnect
+          if (reconnect()) {
+            lastReconnectAttempt = 0;
+          }
+        }
+      } else {
+        // Client connected
+    
+        client.loop();
+      }
+    
+
+if (currentMillis - previousMillis >= 250) {
+    
+    previousMillis = currentMillis;
+    //Serial.print("Millis");
+    //Serial.println(millis());
+    Serial.println(myString.indexOf("on"));
+    
+    
+    if ((myString.indexOf("on") >= 0) && relais ==1) {  
+          
+      digitalWrite(13, HIGH); delay (delaytime);// das ist D4
+      digitalWrite(13, LOW);delay (delaytime);
+      
+      for (int i=0;i<6;i++) {
+        digitalWrite(12, HIGH);delay (delaytime);
+        digitalWrite(12, LOW);delay (delaytime);
+      }
+  
+      digitalWrite(13, HIGH); delay (delaytime);// das ist D4
+      digitalWrite(13, LOW);delay (delaytime);
+       
+      for (int i=0;i<2;i++) {
+        digitalWrite(12, HIGH);delay (delaytime);
+        digitalWrite(12, LOW);delay (delaytime);
+      }    
+
+      digitalWrite(13, HIGH); delay (delaytime);// das ist D4
+      digitalWrite(13, LOW);delay (delaytime);
+      
+      relais = 0;
+      Serial.println("Relais1:On");
+      //client.publish("fhem/relais/info","Relais 1 an GPIO2 NO -> close",true);
+    }
+    if ((myString.indexOf("off") >= 0) && relais ==1){ 
+      
+      digitalWrite(13, HIGH); delay (delaytime);// das ist D4
+      digitalWrite(13, LOW);delay (delaytime);
+      
+      for (int i=0;i<6;i++) {
+        digitalWrite(12, HIGH);delay (delaytime);
+        digitalWrite(12, LOW);delay (delaytime);
+      }
+  
+      digitalWrite(13, HIGH); delay (delaytime);// das ist D4
+      digitalWrite(13, LOW);delay (delaytime);
+       
+      for (int i=0;i<3;i++) {
+        digitalWrite(12, HIGH);delay (delaytime);
+        digitalWrite(12, LOW);delay (delaytime);
+      }    
+
+      digitalWrite(13, HIGH); delay (delaytime);// das ist D4
+      digitalWrite(13, LOW);delay (delaytime);
+      relais = 0;
+      Serial.println("Relais1:Off");
+      client.publish("fhem/relais/info","Relais 1 an GPIO2 close -> NO",true);
+    }
+    if ((myString.indexOf("on") >= 0) && relais ==2) { 
+      //digitalWrite(0, HIGH);  // das ist D3
+      //Serial.println("Relais2:On");
+      //client.publish("fhem/relais/info","Relais 2 an GPIO0 NO -> close",true);
+    }
+    if ((myString.indexOf("off") >= 0) && relais ==2){ 
+      //digitalWrite(0, LOW);
+      //Serial.println("Relais2:Off");
+      //client.publish("fhem/relais/info","Relais 2 an GPIO0 close -> NO",true);
+    }
+    client.loop();
+}
+   
+                      
+}
